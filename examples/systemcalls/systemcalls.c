@@ -16,6 +16,11 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+   int ret;
+   ret = system(cmd);
+   if (ret == -1 ) {
+   	return false;
+   }
 
     return true;
 }
@@ -58,6 +63,33 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    int status;
+    pid_t pid;
+    pid = fork();
+    if (pid == -1) {
+       return false;
+    } else if (pid == 0) {
+       // Child process started without error.
+       execv(command[0], command);
+
+       // Child process will only get to this point if an error occurs.
+       perror("execv failed");
+       exit(-1);
+    }
+
+    // Parent process. Wait for response from child process.
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+         if (WEXITSTATUS(status) == 0) {
+	   // Child process returned successfully. 
+	   return true;
+	 } else {
+	    // Child process returned an error.
+	    return false;
+	 }
+    } else {
+       return false;
+    }
 
     va_end(args);
 
@@ -92,6 +124,44 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    int status;
+    pid_t pid;
+    pid = fork();
+    int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) {
+        return false;
+    }
+   
+    if (pid == -1) {
+       return false;
+    } else if (pid == 0) {
+       // Child process started without error.
+       if (dup2(fd, 1) < 0) {
+	  perror("dup2");
+      	  exit(-1);
+    	}
+    	close(fd);
+	execv(command[0], command);
+
+       // Child process will only get to this point if an error occurs.
+       perror("execv failed");
+       exit(-1);
+    }
+
+    // Parent process. Wait for response from child process.
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+         if (WEXITSTATUS(status) == 0) {
+           // Child process returned successfully. 
+           return true;
+         } else {
+            // Child process returned an error.
+            return false;
+         }
+    } else {
+       return false;
+    }
+
 
     va_end(args);
 
