@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 if [ $# -lt 2 ]; then
    echo "Usage:"
@@ -13,13 +13,8 @@ if [ ! -d $1 ]; then
    exit 1
 fi
 
-SUMLINES=0
-SUMFILES=0
-while read -r line; do
-   NUMLINES=$(echo $line | cut -d ":" -f 2)
-   SUMLINES=$((SUMLINES+NUMLINES))
-   SUMFILES=$((SUMFILES+1))
-done <<< "$(grep $2 $1/* -c -s)"
-echo "The number of files are $SUMFILES and the number of matching lines are $SUMLINES"
-exit 0
+NFILES=$(find $1 -type f | wc -l)
+NLINES=$(grep -e $2 -r $1 | wc -l)
+
+echo The number of files are $NFILES and the number of matching lines are $NLINES
 
