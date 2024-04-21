@@ -1,4 +1,5 @@
 #!/bin/sh
+# Use /bin/sh instead of /bin/bash for assignemtn 3 and later.
 
 if [ $# -lt 2 ]; then
    echo "Usage:"
