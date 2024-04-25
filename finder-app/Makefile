@@ -1,13 +1,13 @@
-CC=gcc
-CFLAGS=-I.
+SRC := writer.c
+TARGET = writer
+OBJS := $(SRC:.c=.o)
 
-ifeq ($(CROSS_COMPILE), aarch64-none-linux-gnu-)
-	CC=$(CROSS_COMPILE)gcc
-endif
+all: $(TARGET)
 
-writermake: writer.c
-	$(CC) -o writer writer.c -I.
+# if crosscompile is specified, prepend that to gcc
+$(TARGET) : $(OBJS)
+# $(TARGET) : writer.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
 clean:
-	rm -f ./writer
-	rm -f ./*.o
+	-rm -f *.o $(TARGET) *.elf *.map
