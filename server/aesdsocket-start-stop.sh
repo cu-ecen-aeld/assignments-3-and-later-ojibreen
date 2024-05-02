@@ -1,5 +1,6 @@
 #!/bin/sh
 
+# Start and stop aesdsocket in daemon mode.
 case "$1" in 
 	start)
 		echo  -n "Starting aesdsocket daemon "
