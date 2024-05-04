@@ -47,7 +47,7 @@ void signalHandler(int signo) {
     }
 }
 
-int initSignalHandler() {
+int initSignalHandler(void) {
     sig_action.sa_handler = signalHandler;
     memset(&sig_action.sa_mask, 1, sizeof(sig_action.sa_mask));
     if(sigaction(SIGINT, &sig_action, NULL) != 0) {
@@ -65,12 +65,13 @@ int initSignalHandler() {
     return 0;
 }
 
-void *timestampHandler() {
+// Writes timestamps to the data file on an interval.
+void timestampHandler(void) {
     while(1) {
         pthread_mutex_lock(&fileMutex);
         if(terminate) {
             pthread_mutex_unlock(&fileMutex);
-            return 0;
+            return;
         }
         FILE *dataFile = fopen(FILENAME, "a");
         if(dataFile == NULL) {
@@ -92,10 +93,11 @@ void *timestampHandler() {
 
         sleep(TIMESTAMP_DELAY);
     }
-    return 0;
+    return;
 }
 
-int initTimestampThread() {
+// Starts a thread to handle timestamp write operations to file.
+int initTimestampHandler(void) {
     pthread_t timestampThread;
     if(pthread_create(&timestampThread, NULL, (void *) timestampHandler, NULL) < 0) {
         perror("Timestamp thread failed");
@@ -123,6 +125,7 @@ int sendFileContentsOverSocket(socket_context *socketContext) {
     return 0;
 }
 
+// Handles data exchange after a socket connetion is made.
 int exchangeData(socket_context *pSocketContext) {
     pthread_mutex_lock(&fileMutex);
     FILE *dataFile = fopen(FILENAME, "a");
@@ -149,7 +152,8 @@ int exchangeData(socket_context *pSocketContext) {
     return 0;
 }
 
-int handleConnections(socket_context *pSocketContext) {
+// Initiates socket connections and invokes data exchange operations.
+int initConnectionHandler(socket_context *pSocketContext) {
     while(1) {
         if(terminate) {
             // A termination signal was sent. Immediately break out of this loop and exit the function.
@@ -177,6 +181,7 @@ int handleConnections(socket_context *pSocketContext) {
     return 0;
 }
 
+// Frees up dynamically allocated memory and nulls out the socket context pointers.
 int cleanup(socket_context *pSocketContext) {
     freeaddrinfo(pSocketContext->pAddrInfo);
     pSocketContext->pAddrInfo = NULL;
@@ -191,6 +196,7 @@ int cleanup(socket_context *pSocketContext) {
     return 0;
 }
 
+// Main routine.
 int main(int argc, char *argv[]) {
     pSocketContext = malloc(sizeof(socket_context));
     struct sockaddr_storage sockAddrStorage;
@@ -230,16 +236,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    /*
-    int sockOpt = 1;
-    if(setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &sockOpt, sizeof(sockOpt))) {
-        syslog(LOG_ERR,"Could not set socket options.");
-        free(pSocketContext);
-        freeaddrinfo(pAddrInfo);
-        exit(EXIT_FAILURE);
-    }
-     */
-
+    // Bind the socket to address and port.
     if(bind(socketFd, pAddrInfo->ai_addr, pAddrInfo->ai_addrlen) == -1) {
         syslog(LOG_ERR, "Could not bind socket to address.");
         free(pSocketContext);
@@ -247,17 +244,21 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    // Start listening for connections.
     if(listen(socketFd, BACKLOG) == -1) {
         syslog(LOG_ERR, "Could not invoke listen on socket.");
     }
     sockAddrStorageSize = sizeof(sockAddrStorage);
     
+    // Setup the socket context pointer, which is used as convenience to point to socket-related
+    // data in a single structure.
     pSocketContext->pSocketFd = &socketFd;
     pSocketContext->pSockAddrStorage = &sockAddrStorage;
     pSocketContext->pSockAddrStorageSize = &sockAddrStorageSize;
     pSocketContext->pHints = &hints;
     pSocketContext->pAddrInfo = pAddrInfo;
     
+    // Check if we're running as a daemon. If so, fork a new process.
     if(runAsDaemon) {
         pid = fork();
         if (pid == -1) {
@@ -289,11 +290,12 @@ int main(int argc, char *argv[]) {
         dup2(fd, 1);
 
         // Start the timestamp thread.
-        initTimestampThread();
+        initTimestampHandler();
         
         // Begin accepting connections and exchanging data.
-        handleConnections(pSocketContext);
+        initConnectionHandler(pSocketContext);
         
+        // After the program is done accepting connections (i.e. after a term signal is received, start cleaning up.
         syslog(LOG_USER, "Closing connections and cleaning up.");
         cleanup(pSocketContext);
         
@@ -309,14 +311,17 @@ int main(int argc, char *argv[]) {
         exit(EXIT_SUCCESS);
     }
 
-    // Running interactively (not as a daemon).
+    // PARENT PROCESS
+    // Running in non-daemon mode.
     syslog(LOG_USER, "Running in interactive mode.");
 
     // Start the timestamp thread.
-    initTimestampThread();
+    initTimestampHandler();
     
     // Begin accepting connections and exchanging data.
-    handleConnections(pSocketContext);
+    initConnectionHandler(pSocketContext);
+    
+    // After the program is done accepting connections (i.e. after a term signal is received, start cleaning up.
     syslog(LOG_USER, "Closing connections and cleaning up.");
     cleanup(pSocketContext);
     if(socketFd != -1) {
