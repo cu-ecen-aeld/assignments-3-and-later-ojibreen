@@ -1,7 +1,9 @@
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -12,12 +14,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT "9000"
 #define BACKLOG 10
-#define FILENAME "/tmp/aesdsocketdata"
+#define FILENAME "/var/tmp/aesdsocketdata"
 #define BUFFERSIZE 1024
+#define TIMESTAMP_DELAY 10
 
 // Used to store pointers to file descriptors, structs and variables needed for socket management.
 typedef struct {
@@ -30,7 +34,8 @@ typedef struct {
 } socket_context;
 
 static struct sigaction sig_action = {0};
-
+socket_context *pSocketContext;
+pthread_mutex_t fileMutex;
 
 // Flag set by SIGTERM and SIGINT to notify functions to stop what they're doing and exit.
 bool terminate = false;
@@ -60,64 +65,113 @@ int initSignalHandler() {
     return 0;
 }
 
-int sendFileContentsOverSocket(socket_context *socketContext) {
-	ssize_t bytesRead = 0;
-	FILE *dataFile = fopen(FILENAME, "r");
-    if(!dataFile) {
-		syslog(LOG_ERR, "Error opening data file.");
-		return -1;
-	}
+void *timestampHandler() {
+    while(1) {
+        pthread_mutex_lock(&fileMutex);
+        if(terminate) {
+            pthread_mutex_unlock(&fileMutex);
+            return 0;
+        }
+        FILE *dataFile = fopen(FILENAME, "a");
+        if(dataFile == NULL) {
+            perror("fopen");
+            syslog(LOG_ERR, "Failed to open data file.");
+            pthread_mutex_unlock(&fileMutex);
+            sleep(TIMESTAMP_DELAY);
+            continue;
+        }
 
-	char buffer[BUFFERSIZE];
-	while((bytesRead = fread(buffer, 1, sizeof(buffer), dataFile))){
-		if((send(*socketContext->pAcceptConnectionFd, buffer, bytesRead, 0)) != bytesRead) {
-			syslog(LOG_ERR, "Error sending file contents over socket connection.");
-			return -1;
-		}
-	}
-	fclose(dataFile);
+        time_t now = time(NULL);
+        struct tm *pTimeData = localtime(&now);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "timestamp:%Y-%m-%d %H:%M:%S\n", pTimeData);
+
+        fprintf(dataFile, "%s", timestamp);
+        fclose(dataFile);
+        pthread_mutex_unlock(&fileMutex);
+
+        sleep(TIMESTAMP_DELAY);
+    }
     return 0;
 }
 
-int receive(socket_context *pSocketContext) {
-	FILE *dataFile = fopen(FILENAME, "a");
-    if(!dataFile){
-        syslog(LOG_ERR, "Unable to open file for writing.");
+int initTimestampThread() {
+    pthread_t timestampThread;
+    if(pthread_create(&timestampThread, NULL, (void *) timestampHandler, NULL) < 0) {
+        perror("Timestamp thread failed");
+        return-1;
+    }
+    return 0;
+}
+
+int sendFileContentsOverSocket(socket_context *socketContext) {
+    ssize_t bytesRead = 0;
+    FILE *dataFile = fopen(FILENAME, "r");
+    if(!dataFile) {
+        syslog(LOG_ERR, "Error opening data file.");
         return -1;
     }
 
-    size_t bytesReceived = 0;
-	char buffer[BUFFERSIZE];
+    char buffer[BUFFERSIZE];
+    while((bytesRead = fread(buffer, 1, sizeof(buffer), dataFile))){
+        if((send(*socketContext->pAcceptConnectionFd, buffer, bytesRead, 0)) != bytesRead) {
+            syslog(LOG_ERR, "Error sending file contents over socket connection.");
+            return -1;
+        }
+    }
+    fclose(dataFile);
+    return 0;
+}
 
-	while((bytesReceived = recv(*pSocketContext->pAcceptConnectionFd, buffer, sizeof(buffer), 0)) > 0) {
+int exchangeData(socket_context *pSocketContext) {
+    pthread_mutex_lock(&fileMutex);
+    FILE *dataFile = fopen(FILENAME, "a");
+    if(!dataFile){
+        syslog(LOG_ERR, "Unable to open file for writing.");
+        pthread_mutex_unlock(&fileMutex);
+        return -1;
+    }
+    
+    size_t bytesReceived = 0;
+    char buffer[BUFFERSIZE];
+
+    while((bytesReceived = recv(*pSocketContext->pAcceptConnectionFd, buffer, sizeof(buffer), 0)) > 0) {
         fwrite(buffer, 1, bytesReceived, dataFile);
         if(memchr(buffer, '\n', bytesReceived) != NULL) {
-            break; 
+            break;
         }
     }
     fclose(dataFile);
     
     // Send back the contents of the file over the socket connection.
     sendFileContentsOverSocket(pSocketContext);
-	return 0;
+    pthread_mutex_unlock(&fileMutex);
+    return 0;
 }
 
-int acceptConnections(socket_context *pSocketContext) {
+int handleConnections(socket_context *pSocketContext) {
     while(1) {
         if(terminate) {
             // A termination signal was sent. Immediately break out of this loop and exit the function.
             return 0;
         }
+        
+        pthread_t threadId;
         *pSocketContext->pSockAddrStorageSize = sizeof(*pSocketContext->pSockAddrStorage);
-		int acceptedConnectionFd = accept(*pSocketContext->pSocketFd, (struct sockaddr *) pSocketContext->pSockAddrStorage, pSocketContext->pSockAddrStorageSize);
-		if (acceptedConnectionFd == -1){
-		    syslog(LOG_ERR, "Eroor accepting connection.");
-			continue;
-		} else {
+        int acceptedConnectionFd = accept(*pSocketContext->pSocketFd, (struct sockaddr *) pSocketContext->pSockAddrStorage, pSocketContext->pSockAddrStorageSize);
+        if (acceptedConnectionFd == -1){
+            syslog(LOG_ERR, "Eroor accepting connection.");
+            continue;
+        } else {
             pSocketContext->pAcceptConnectionFd = &acceptedConnectionFd;
             syslog(LOG_USER, "Accepted connection.");
             
-            receive(pSocketContext);
+            if(pthread_create(&threadId, NULL, (void *) exchangeData, (socket_context *) pSocketContext) < 0) {
+                perror("pthread_create");
+                syslog(LOG_ERR, "Unable to create thread while accepting connection.");
+                return -1;
+            }
+            pthread_join(threadId , NULL);
         }
     }
     return 0;
@@ -138,7 +192,7 @@ int cleanup(socket_context *pSocketContext) {
 }
 
 int main(int argc, char *argv[]) {
-    socket_context *pSocketContext = malloc(sizeof(socket_context));
+    pSocketContext = malloc(sizeof(socket_context));
     struct sockaddr_storage sockAddrStorage;
     socklen_t sockAddrStorageSize;
     struct addrinfo hints, *pAddrInfo;
@@ -170,12 +224,13 @@ int main(int argc, char *argv[]) {
 
     socketFd = socket(pAddrInfo->ai_family, pAddrInfo->ai_socktype, pAddrInfo->ai_protocol);
     if (socketFd == -1){
-		free(pSocketContext);
+        free(pSocketContext);
         freeaddrinfo(pAddrInfo);
-		syslog(LOG_ERR, "Error creating socket");
-		exit(EXIT_FAILURE);
-	}
+        syslog(LOG_ERR, "Error creating socket");
+        exit(EXIT_FAILURE);
+    }
 
+    /*
     int sockOpt = 1;
     if(setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &sockOpt, sizeof(sockOpt))) {
         syslog(LOG_ERR,"Could not set socket options.");
@@ -183,6 +238,7 @@ int main(int argc, char *argv[]) {
         freeaddrinfo(pAddrInfo);
         exit(EXIT_FAILURE);
     }
+     */
 
     if(bind(socketFd, pAddrInfo->ai_addr, pAddrInfo->ai_addrlen) == -1) {
         syslog(LOG_ERR, "Could not bind socket to address.");
@@ -201,7 +257,7 @@ int main(int argc, char *argv[]) {
     pSocketContext->pSockAddrStorageSize = &sockAddrStorageSize;
     pSocketContext->pHints = &hints;
     pSocketContext->pAddrInfo = pAddrInfo;
-
+    
     if(runAsDaemon) {
         pid = fork();
         if (pid == -1) {
@@ -218,7 +274,7 @@ int main(int argc, char *argv[]) {
             syslog(LOG_ERR, "setsid failed after fark.");
             perror("setsid");
             return -1;
-        }    
+        }
         
         // CHILD PROCESS STARTED
         // Set the working directory of child processto the root directory.
@@ -232,8 +288,12 @@ int main(int argc, char *argv[]) {
         int fd = open("/dev/null", O_WRONLY | O_CREAT, 0666);
         dup2(fd, 1);
 
-        // Begin accepting connections and data.
-        acceptConnections(pSocketContext);
+        // Start the timestamp thread.
+        initTimestampThread();
+        
+        // Begin accepting connections and exchanging data.
+        handleConnections(pSocketContext);
+        
         syslog(LOG_USER, "Closing connections and cleaning up.");
         cleanup(pSocketContext);
         
@@ -252,8 +312,11 @@ int main(int argc, char *argv[]) {
     // Running interactively (not as a daemon).
     syslog(LOG_USER, "Running in interactive mode.");
 
-    // Begin accepting connections and data.
-    acceptConnections(pSocketContext);
+    // Start the timestamp thread.
+    initTimestampThread();
+    
+    // Begin accepting connections and exchanging data.
+    handleConnections(pSocketContext);
     syslog(LOG_USER, "Closing connections and cleaning up.");
     cleanup(pSocketContext);
     if(socketFd != -1) {
@@ -262,3 +325,5 @@ int main(int argc, char *argv[]) {
     closelog();
     exit(EXIT_SUCCESS);
 }
+
+
