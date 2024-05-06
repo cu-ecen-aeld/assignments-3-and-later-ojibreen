@@ -18,26 +18,13 @@
 #include <unistd.h>
 
 #define PORT "9000"
-#define BACKLOG 10
+#define BACKLOG 100
 #define FILENAME "/var/tmp/aesdsocketdata"
 #define BUFFERSIZE 1024
-#define TIMESTAMP_DELAY 10
-
-// Used to store pointers to file descriptors, structs and variables needed for socket management.
-typedef struct {
-    struct sockaddr_storage *pSockAddrStorage;
-    socklen_t *pSockAddrStorageSize;
-    struct addrinfo *pHints;
-    struct addrinfo *pAddrInfo;
-    int *pSocketFd;
-    int *pAcceptConnectionFd;
-} socket_context;
+#define TIMESTAMPDELAY 10
 
 static struct sigaction sig_action = {0};
-socket_context *pSocketContext;
 pthread_mutex_t fileMutex;
-
-// Flag set by SIGTERM and SIGINT to notify functions to stop what they're doing and exit.
 bool terminate = false;
 
 void signalHandler(int signo) {
@@ -78,7 +65,7 @@ void timestampHandler(void) {
             perror("fopen");
             syslog(LOG_ERR, "Failed to open data file.");
             pthread_mutex_unlock(&fileMutex);
-            sleep(TIMESTAMP_DELAY);
+            sleep(TIMESTAMPDELAY);
             continue;
         }
 
@@ -91,7 +78,7 @@ void timestampHandler(void) {
         fclose(dataFile);
         pthread_mutex_unlock(&fileMutex);
 
-        sleep(TIMESTAMP_DELAY);
+        sleep(TIMESTAMPDELAY);
     }
     return;
 }
@@ -106,39 +93,21 @@ int initTimestampHandler(void) {
     return 0;
 }
 
-int sendFileContentsOverSocket(socket_context *socketContext) {
-    ssize_t bytesRead = 0;
-    FILE *dataFile = fopen(FILENAME, "r");
-    if(!dataFile) {
-        syslog(LOG_ERR, "Error opening data file.");
-        return -1;
-    }
-
-    char buffer[BUFFERSIZE];
-    while((bytesRead = fread(buffer, 1, sizeof(buffer), dataFile))){
-        if((send(*socketContext->pAcceptConnectionFd, buffer, bytesRead, 0)) != bytesRead) {
-            syslog(LOG_ERR, "Error sending file contents over socket connection.");
-            return -1;
-        }
-    }
-    fclose(dataFile);
-    return 0;
-}
-
 // Handles data exchange after a socket connetion is made.
-int exchangeData(socket_context *pSocketContext) {
+void *exchangeData(void * pConnFd) {
+    int connectionFd = *((int *) pConnFd);
     pthread_mutex_lock(&fileMutex);
     FILE *dataFile = fopen(FILENAME, "a");
     if(!dataFile){
         syslog(LOG_ERR, "Unable to open file for writing.");
         pthread_mutex_unlock(&fileMutex);
-        return -1;
+        return 0;
     }
     
     size_t bytesReceived = 0;
     char buffer[BUFFERSIZE];
 
-    while((bytesReceived = recv(*pSocketContext->pAcceptConnectionFd, buffer, sizeof(buffer), 0)) > 0) {
+    while((bytesReceived = recv(connectionFd, buffer, sizeof(buffer), 0)) > 0) {
         fwrite(buffer, 1, bytesReceived, dataFile);
         if(memchr(buffer, '\n', bytesReceived) != NULL) {
             break;
@@ -146,14 +115,30 @@ int exchangeData(socket_context *pSocketContext) {
     }
     fclose(dataFile);
     
-    // Send back the contents of the file over the socket connection.
-    sendFileContentsOverSocket(pSocketContext);
+    // Send back the contents of the file to the client.
+    ssize_t bytesRead = 0;
+    dataFile = fopen(FILENAME, "r");
+    if(!dataFile) {
+        syslog(LOG_ERR, "Error opening data file.");
+        return 0;
+    }
+
+    // Reset buffer and start sending.
+    memset(buffer, 0, sizeof(buffer));
+    while((bytesRead = fread(buffer, 1, sizeof(buffer), dataFile))){
+        if((send(connectionFd, buffer, bytesRead, 0)) != bytesRead) {
+            syslog(LOG_ERR, "Error sending file contents over socket connection.");
+            return 0;
+        }
+    }
+    fclose(dataFile);
     pthread_mutex_unlock(&fileMutex);
     return 0;
 }
 
 // Initiates socket connections and invokes data exchange operations.
-int initConnectionHandler(socket_context *pSocketContext) {
+int initConnectionHandler(int *pSocketFd, struct sockaddr_storage *pSockAddrStorage) {
+    socklen_t sockAddrStorageSize = sizeof(*pSockAddrStorage);
     while(1) {
         if(terminate) {
             // A termination signal was sent. Immediately break out of this loop and exit the function.
@@ -161,16 +146,14 @@ int initConnectionHandler(socket_context *pSocketContext) {
         }
         
         pthread_t threadId;
-        *pSocketContext->pSockAddrStorageSize = sizeof(*pSocketContext->pSockAddrStorage);
-        int acceptedConnectionFd = accept(*pSocketContext->pSocketFd, (struct sockaddr *) pSocketContext->pSockAddrStorage, pSocketContext->pSockAddrStorageSize);
-        if (acceptedConnectionFd == -1){
+        int connectionFd = accept(*pSocketFd, (struct sockaddr *) pSockAddrStorage, &sockAddrStorageSize);
+        if (connectionFd == -1){
             syslog(LOG_ERR, "Eroor accepting connection.");
             continue;
         } else {
-            pSocketContext->pAcceptConnectionFd = &acceptedConnectionFd;
             syslog(LOG_USER, "Accepted connection.");
             
-            if(pthread_create(&threadId, NULL, (void *) exchangeData, (socket_context *) pSocketContext) < 0) {
+            if(pthread_create(&threadId, NULL, exchangeData, (void *) &connectionFd) < 0) {
                 perror("pthread_create");
                 syslog(LOG_ERR, "Unable to create thread while accepting connection.");
                 return -1;
@@ -181,26 +164,62 @@ int initConnectionHandler(socket_context *pSocketContext) {
     return 0;
 }
 
-// Frees up dynamically allocated memory and nulls out the socket context pointers.
-int cleanup(socket_context *pSocketContext) {
-    freeaddrinfo(pSocketContext->pAddrInfo);
-    pSocketContext->pAddrInfo = NULL;
-    pSocketContext->pHints = NULL;
-    pSocketContext->pSockAddrStorage = NULL;
-    pSocketContext->pSockAddrStorageSize = NULL;
-    pSocketContext->pSocketFd = NULL;
-    pSocketContext->pAcceptConnectionFd = NULL;
+int daemonize(int *pSocketFd, struct sockaddr_storage *pSockAddrStorage) {
+    pid_t pid = fork();
+    if(pid == -1) {
+        syslog(LOG_ERR, "Unable to fork.");
+        perror("fork");
+        return -1;
+    } else if(pid != 0) {
+        syslog(LOG_USER, "Running in daemon mode.");
+        exit(EXIT_SUCCESS);
+    }
+        
+    // Create new session and process group.
+    if(setsid() == -1) {
+        syslog(LOG_ERR, "setsid failed after fark.");
+        perror("setsid");
+        return -1;
+    }
+    
+    // CHILD PROCESS STARTED
+    // Set the working directory of child processto the root directory.
+    if(chdir("/") == -1) {
+        syslog(LOG_ERR, "chdir failed after fork.");
+        perror("chdir");
+        return -1;
+    }
 
-    free(pSocketContext);
+    // Redirect fds to /dev/null
+    int nullFd = open("/dev/null", O_WRONLY | O_CREAT, 0666);
+    dup2(nullFd, 1);
+
+    // Start the timestamp thread.
+    initTimestampHandler();
+    
+    // Begin accepting connections and exchanging data.
+    initConnectionHandler(pSocketFd, pSockAddrStorage);
+    
+    // After the program is done accepting connections (i.e. after a term signal is received, start cleaning up.
+    syslog(LOG_USER, "Closing connections and cleaning up.");
     remove(FILENAME);
-    return 0;
+    
+    if(nullFd != -1) {
+        close(nullFd);
+    }
+
+    if(*pSocketFd != -1) {
+        close(*pSocketFd);
+    }
+    
+    closelog();
+    exit(EXIT_SUCCESS);
 }
 
 // Main routine.
 int main(int argc, char *argv[]) {
-    pSocketContext = malloc(sizeof(socket_context));
+    openlog(NULL, 0, LOG_USER);
     struct sockaddr_storage sockAddrStorage;
-    socklen_t sockAddrStorageSize;
     struct addrinfo hints, *pAddrInfo;
     int socketFd;
     
@@ -208,10 +227,8 @@ int main(int argc, char *argv[]) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
-    pid_t pid;
 
     bool runAsDaemon = false;
-    openlog(NULL, 0, LOG_USER);
     
     for(int i = 1; i < argc; i++) {
         if (strstr(argv[i], "-d")) {
@@ -230,7 +247,6 @@ int main(int argc, char *argv[]) {
 
     socketFd = socket(pAddrInfo->ai_family, pAddrInfo->ai_socktype, pAddrInfo->ai_protocol);
     if (socketFd == -1){
-        free(pSocketContext);
         freeaddrinfo(pAddrInfo);
         syslog(LOG_ERR, "Error creating socket");
         exit(EXIT_FAILURE);
@@ -239,76 +255,21 @@ int main(int argc, char *argv[]) {
     // Bind the socket to address and port.
     if(bind(socketFd, pAddrInfo->ai_addr, pAddrInfo->ai_addrlen) == -1) {
         syslog(LOG_ERR, "Could not bind socket to address.");
-        free(pSocketContext);
         freeaddrinfo(pAddrInfo);
         exit(EXIT_FAILURE);
     }
+    
+    // Free dynamically allocated memory.
+    freeaddrinfo(pAddrInfo);
 
     // Start listening for connections.
     if(listen(socketFd, BACKLOG) == -1) {
         syslog(LOG_ERR, "Could not invoke listen on socket.");
     }
-    sockAddrStorageSize = sizeof(sockAddrStorage);
-    
-    // Setup the socket context pointer, which is used as convenience to point to socket-related
-    // data in a single structure.
-    pSocketContext->pSocketFd = &socketFd;
-    pSocketContext->pSockAddrStorage = &sockAddrStorage;
-    pSocketContext->pSockAddrStorageSize = &sockAddrStorageSize;
-    pSocketContext->pHints = &hints;
-    pSocketContext->pAddrInfo = pAddrInfo;
     
     // Check if we're running as a daemon. If so, fork a new process.
     if(runAsDaemon) {
-        pid = fork();
-        if (pid == -1) {
-            syslog(LOG_ERR, "Unable to fork.");
-            perror("fork");
-            return -1;
-        } else if(pid != 0) {
-            syslog(LOG_USER, "Running in daemon mode.");
-            exit(EXIT_SUCCESS);
-        }
-            
-        // Create new session and process group.
-        if(setsid() == -1) {
-            syslog(LOG_ERR, "setsid failed after fark.");
-            perror("setsid");
-            return -1;
-        }
-        
-        // CHILD PROCESS STARTED
-        // Set the working directory of child processto the root directory.
-        if(chdir("/") == -1) {
-            syslog(LOG_ERR, "chdir failed after fork.");
-            perror("chdir");
-            return -1;
-        }
-
-        // Redirect fds to /dev/null
-        int fd = open("/dev/null", O_WRONLY | O_CREAT, 0666);
-        dup2(fd, 1);
-
-        // Start the timestamp thread.
-        initTimestampHandler();
-        
-        // Begin accepting connections and exchanging data.
-        initConnectionHandler(pSocketContext);
-        
-        // After the program is done accepting connections (i.e. after a term signal is received, start cleaning up.
-        syslog(LOG_USER, "Closing connections and cleaning up.");
-        cleanup(pSocketContext);
-        
-        if(fd != -1) {
-            close(fd);
-        }
-
-        if(socketFd != -1) {
-            close(socketFd);
-        }
-        
-        closelog();
-        exit(EXIT_SUCCESS);
+        daemonize(&socketFd, &sockAddrStorage);
     }
 
     // PARENT PROCESS
@@ -319,16 +280,18 @@ int main(int argc, char *argv[]) {
     initTimestampHandler();
     
     // Begin accepting connections and exchanging data.
-    initConnectionHandler(pSocketContext);
+    initConnectionHandler(&socketFd, &sockAddrStorage);
     
     // After the program is done accepting connections (i.e. after a term signal is received, start cleaning up.
     syslog(LOG_USER, "Closing connections and cleaning up.");
-    cleanup(pSocketContext);
+    remove(FILENAME);
+    
     if(socketFd != -1) {
         close(socketFd);
     }
     closelog();
     exit(EXIT_SUCCESS);
 }
+
 
 
