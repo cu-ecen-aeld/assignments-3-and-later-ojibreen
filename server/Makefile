@@ -1,15 +1,20 @@
-.PHONY: all, clean
+.PHONY: all clean	
+CC ?= gcc	
+CROSS_COMPILE ?=
 
-CC = $(CROSS_COMPILE)gcc
-CFLAGS = -Wall -Wextra -g
+CFLAGS ?= -g -Wall -Werror 
 SRCS = aesdsocket.c
-OBJS = $(SRCS:.c=.o)
-TARGET = aesdsocket
+TARGET ?= aesdsocket
+LDFLAGS ?= -pthread -lrt
+
+$(TARGET):$(TARGET).o
+	$(CROSS_COMPILE)$(CC) $(CFLAGS) $(LDFLAGS) -I/ $(TARGET).o -o $(TARGET)	
+
+$(TARGET).o:$(TARGET).c
+	$(CROSS_COMPILE)$(CC) $(CFLAGS) $(LDFLAGS) -c $(TARGET).c -o $(TARGET).o	
+
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ -lpthread
-
-clean:
-	rm -f $(TARGET) $(OBJS)
+clean:	
+	rm -f *.o	
