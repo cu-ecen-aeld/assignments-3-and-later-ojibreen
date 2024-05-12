@@ -20,6 +20,7 @@
 #define PORT "9000"
 #define BACKLOG 100
 #define FILENAME "/var/tmp/aesdsocketdata"
+#define DEVICEPATH "/dev/aesdchar"
 #define BUFFERSIZE 1024
 #define TIMESTAMPDELAY 10
 
@@ -60,7 +61,7 @@ void timestampHandler(void) {
             pthread_mutex_unlock(&fileMutex);
             return;
         }
-        FILE *dataFile = fopen(FILENAME, "a");
+        FILE *dataFile = fopen(DEVICEPATH, "w");
         if(dataFile == NULL) {
             perror("fopen");
             syslog(LOG_ERR, "Failed to open data file.");
@@ -97,7 +98,7 @@ int initTimestampHandler(void) {
 void *exchangeData(void * pConnFd) {
     int connectionFd = *((int *) pConnFd);
     pthread_mutex_lock(&fileMutex);
-    FILE *dataFile = fopen(FILENAME, "a");
+    FILE *dataFile = fopen(DEVICEPATH, "w");
     if(!dataFile){
         syslog(LOG_ERR, "Unable to open file for writing.");
         pthread_mutex_unlock(&fileMutex);
@@ -117,7 +118,7 @@ void *exchangeData(void * pConnFd) {
     
     // Send back the contents of the file to the client.
     ssize_t bytesRead = 0;
-    dataFile = fopen(FILENAME, "r");
+    dataFile = fopen(DEVICEPATH, "r");
     if(!dataFile) {
         syslog(LOG_ERR, "Error opening data file.");
         return 0;
@@ -195,7 +196,7 @@ int daemonize(int *pSocketFd, struct sockaddr_storage *pSockAddrStorage) {
     dup2(nullFd, 1);
 
     // Start the timestamp thread.
-    initTimestampHandler();
+    // initTimestampHandler();
     
     // Begin accepting connections and exchanging data.
     initConnectionHandler(pSocketFd, pSockAddrStorage);
@@ -277,7 +278,7 @@ int main(int argc, char *argv[]) {
     syslog(LOG_USER, "Running in interactive mode.");
 
     // Start the timestamp thread.
-    initTimestampHandler();
+    // initTimestampHandler();
     
     // Begin accepting connections and exchanging data.
     initConnectionHandler(&socketFd, &sockAddrStorage);
