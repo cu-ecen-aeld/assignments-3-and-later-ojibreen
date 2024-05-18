@@ -10,12 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "aesd_ioctl.h"
 
 #define PORT "9000"
 #define BACKLOG 100
@@ -94,11 +97,24 @@ int initTimestampHandler(void) {
     return 0;
 }
 
+void sendData(int connectionFd, FILE *dataFile) {
+    ssize_t bytesRead = 0;
+    char buffer[BUFFERSIZE];
+
+    while((bytesRead = read(fileno(dataFile), buffer, 1)) > 0) {
+        if((send(connectionFd, buffer, bytesRead, 0)) != bytesRead) {
+            syslog(LOG_ERR, "Error sending file contents over socket connection.");
+            return;
+        }
+    }
+}
+
+
 // Handles data exchange after a socket connetion is made.
 void *exchangeData(void * pConnFd) {
     int connectionFd = *((int *) pConnFd);
     pthread_mutex_lock(&fileMutex);
-    FILE *dataFile = fopen(DEVICEPATH, "w");
+    FILE *dataFile = fopen(DEVICEPATH, "w+");
     if(!dataFile){
         syslog(LOG_ERR, "Unable to open file for writing.");
         pthread_mutex_unlock(&fileMutex);
@@ -109,28 +125,23 @@ void *exchangeData(void * pConnFd) {
     char buffer[BUFFERSIZE];
 
     while((bytesReceived = recv(connectionFd, buffer, sizeof(buffer), 0)) > 0) {
-        fwrite(buffer, 1, bytesReceived, dataFile);
+        //fwrite(buffer, 1, bytesReceived, dataFile);
         if(memchr(buffer, '\n', bytesReceived) != NULL) {
-            break;
-        }
-    }
-    fclose(dataFile);
-    
-    // Send back the contents of the file to the client.
-    ssize_t bytesRead = 0;
-    dataFile = fopen(DEVICEPATH, "r");
-    if(!dataFile) {
-        syslog(LOG_ERR, "Error opening data file.");
-        return 0;
-    }
-
-    // Reset buffer and start sending.
-    memset(buffer, 0, sizeof(buffer));
-    while((bytesRead = fread(buffer, 1, sizeof(buffer), dataFile))){
-        if((send(connectionFd, buffer, bytesRead, 0)) != bytesRead) {
-            syslog(LOG_ERR, "Error sending file contents over socket connection.");
-            return 0;
-        }
+	   if(strstr(buffer, "AESDCHAR_IOCSEEKTO")) {
+	     syslog(LOG_USER, "Found ioctl command");
+	     struct aesd_seekto cmd;
+	     sscanf(buffer, "AESDCHAR_IOCSEEKTO:%u,%u", &cmd.write_cmd, &cmd.write_cmd_offset); 
+	     syslog(LOG_DEBUG, "Command %u,%u", cmd.write_cmd, cmd.write_cmd_offset);
+	     ioctl(fileno(dataFile), AESDCHAR_IOCSEEKTO, &cmd);
+	     sendData(connectionFd, dataFile);
+	     break;
+	   }
+	   // If not ioctl command is found, write to file, set fpos to 0, and send the contents back to the client.
+	   write(fileno(dataFile), buffer, bytesReceived);
+	   rewind(dataFile);
+	   sendData(connectionFd, dataFile);
+	   break; 
+	}
     }
     fclose(dataFile);
     pthread_mutex_unlock(&fileMutex);

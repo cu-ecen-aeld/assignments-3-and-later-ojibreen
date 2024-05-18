@@ -20,6 +20,7 @@
 #include<linux/slab.h>
 #include<linux/uaccess.h>
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -54,7 +55,6 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     struct aesd_dev *dev;
     struct aesd_buffer_entry * p_entry;
     size_t entry_offset = 0;
-    PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
     /**
      * TODO: handle read
      */
@@ -72,7 +72,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     dev = filp->private_data; 
     if(dev == NULL)
     {
-        printk("Null dev struct\n");
+        printk("Encountered null device structure.\n");
         return -EINVAL;
     }
     // Setup locking
@@ -84,7 +84,6 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     
     if(p_entry == NULL)
     {
-        PDEBUG("Position greather than buffer size");
         goto done;
     }
 
@@ -175,12 +174,128 @@ done:
     return retval;
 }
 
+static loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+	loff_t pos;
+    size_t size = 0UL;
+    size_t i = 0UL;
+    struct aesd_buffer_entry *entry = NULL;
+
+    if(mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->circular_buffer, i)
+    {
+        size += entry->size;
+    }
+
+	switch(whence) {
+	  // SEEK_SET
+	  case 0: 
+		pos = off;
+		break;
+      // SEEK_CUR
+	  case 1:
+		pos = filp->f_pos + off;
+		break;
+      // SEEK_END
+	  case 2:
+		pos = size + off;
+		break;
+		
+	  default:
+		return -EINVAL;
+	}
+	
+	if(pos < 0)
+        return -EINVAL;
+
+	filp->f_pos = pos;
+
+    mutex_unlock(&dev->lock);
+
+	return pos;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+
+	int err = 0;
+	int retval = 0;
+    size_t size = 0;
+
+    struct aesd_seekto seekTo;
+    struct aesd_dev *dev;
+    uint8_t i;
+    struct aesd_buffer_entry *entry = NULL;
+    printk("Ioctl called\n");
+	
+	if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) return -ENOTTY;
+	if(_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) return -ENOTTY;
+
+	if(_IOC_DIR(cmd) & _IOC_READ)
+		err = !access_ok((void __user *) arg, _IOC_SIZE(cmd));
+	else if(_IOC_DIR(cmd) & _IOC_WRITE)
+		err =  !access_ok((void __user *) arg, _IOC_SIZE(cmd));
+	if(err) return -EFAULT;
+
+    dev = filp->private_data;
+    if(mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+
+    if(arg == 0)
+    {
+        return -EFAULT;
+    }
+    else
+    {
+        retval = copy_from_user(&seekTo, (void *) arg, sizeof(struct aesd_seekto));
+        if(retval)
+        {
+            retval = -EFAULT;
+            goto done;
+        }
+    }
+
+	if(cmd == AESDCHAR_IOCSEEKTO)
+    {
+        if(seekTo.write_cmd > 9)
+            return -EINVAL;
+
+        if(seekTo.write_cmd_offset >= dev->circular_buffer.entry[seekTo.write_cmd].size)
+            return -EINVAL;
+
+        AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.circular_buffer, i)
+        {
+            if(i < seekTo.write_cmd)
+            {
+                size += entry->size;
+            }
+            else
+            {
+                size += seekTo.write_cmd_offset;
+                break;
+            }
+        }
+
+        filp->f_pos = size;
+    }
+
+done:
+    mutex_unlock(&dev->lock);
+	return retval;
+
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek = aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
